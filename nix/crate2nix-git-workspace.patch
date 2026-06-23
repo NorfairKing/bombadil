@@ -1,0 +1,91 @@
+--- a/tools.nix
++++ b/tools.nix
+@@ -430,11 +430,77 @@
+                     allCargoTomls);
+ 
+               pathToExtract = lib.removeSuffix "Cargo.toml" packageCargoToml;
++
++              # Workspace-inheritance fix. A git dependency that is a member of a
++              # cargo workspace (e.g. boa_engine in the boa monorepo) inherits
++              # fields like `edition.workspace = true` and `dep.workspace = true`
++              # from its workspace root. Extracting only the crate subdirectory
++              # drops that root, so `cargo metadata` cannot resolve the
++              # inheritance. We resolve it in place -- exactly what `cargo vendor`
++              # does -- substituting concrete values from the workspace root and
++              # writing a self-contained manifest. We deliberately do NOT add a
++              # `[workspace]` table (that would turn the crate into a nested
++              # workspace and make cargo demand a separate lock file).
++              crateToml = builtins.fromTOML (builtins.readFile packageCargoToml);
++              wsRootTomls = builtins.filter
++                (p: (builtins.fromTOML (builtins.readFile p)) ? workspace)
++                allCargoTomls;
++              needsDeinherit = (builtins.length wsRootTomls) > 0 && !(crateToml ? workspace);
++              wsRoot =
++                if needsDeinherit
++                then (builtins.fromTOML (builtins.readFile (builtins.head wsRootTomls))).workspace
++                else { };
++              wsPkg = wsRoot.package or { };
++              wsDeps = wsRoot.dependencies or { };
++              gitRev = if isNull parsed.urlFragment then parsed.rev else parsed.urlFragment;
++              isInherit = v: (builtins.isAttrs v) && ((v.workspace or null) == true);
++              resolvePkgField = fname: v: if isInherit v then (wsPkg.${fname} or v) else v;
++              # Resolve a workspace.dependencies entry to a self-contained spec.
++              # Workspace-internal deps are declared with a relative `path`; those
++              # paths don't exist in the extracted crate, and the deps live in the
++              # same git repo (per Cargo.lock). Rewrite `path` to a `git`+`rev`
++              # spec pointing at this crate's repo so they resolve to the (later
++              # source-replaced) git source instead of crates.io.
++              depBase = dname:
++                let wd = wsDeps.${dname} or null; in
++                if wd == null then { }
++                else if builtins.isString wd then { version = wd; }
++                else if wd ? path then (builtins.removeAttrs wd [ "path" ]) // { git = parsed.url; rev = gitRev; }
++                else wd;
++              resolveDep = dname: v:
++                if isInherit v
++                then (depBase dname) // (builtins.removeAttrs v [ "workspace" ])
++                else v;
++              resolveDepTable = t: builtins.mapAttrs resolveDep t;
++              # Resolve the three dependency tables inside a single section (the
++              # crate root, or one `[target.'cfg(...)']` block).
++              resolveSection = section:
++                section
++                // lib.optionalAttrs (section ? dependencies) {
++                  dependencies = resolveDepTable section.dependencies;
++                }
++                // lib.optionalAttrs (section ? "dev-dependencies") {
++                  "dev-dependencies" = resolveDepTable section."dev-dependencies";
++                }
++                // lib.optionalAttrs (section ? "build-dependencies") {
++                  "build-dependencies" = resolveDepTable section."build-dependencies";
++                };
++              resolvedToml = (resolveSection crateToml)
++                // { package = builtins.mapAttrs resolvePkgField (crateToml.package or { }); }
++                // lib.optionalAttrs (crateToml ? target) {
++                  target = builtins.mapAttrs (_: resolveSection) crateToml.target;
++                }
++                // lib.optionalAttrs (isInherit (crateToml.lints or null)) {
++                  lints = wsRoot.lints or { };
++                };
++              resolvedTomlFile = (pkgs.formats.toml { }).generate "Cargo.toml" resolvedToml;
+             in
+             pkgs.runCommand (lib.removeSuffix ".tar.gz" src.name) { }
+               ''
+                 mkdir -p $out
+                 cp -apR ${pathToExtract}/* $out
++                chmod -R +w $out
++                ${lib.optionalString needsDeinherit "cp ${resolvedTomlFile} $out/Cargo.toml"}
+                 echo '{"package":null,"files":{}}' > $out/.cargo-checksum.json
+               '';
+ 
+--- a/crate2nix/src/lib.rs
++++ b/crate2nix/src/lib.rs
+@@ -172,7 +172,7 @@
+ fn cargo_metadata(config: &GenerateConfig, cargo_toml: &Path) -> Result<Metadata, Error> {
+     let mut cmd = cargo_metadata::MetadataCommand::new();
+     let mut other_options = config.other_metadata_options.clone();
+-    other_options.push("--locked".into());
++    other_options.push("--offline".into());
+     cmd.manifest_path(cargo_toml).other_options(&*other_options);
+     cmd.exec().map_err(|e| {
+         format_err!(
